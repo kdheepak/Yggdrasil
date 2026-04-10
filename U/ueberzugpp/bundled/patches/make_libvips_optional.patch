@@ -1,0 +1,249 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -35,6 +35,7 @@
+ option(ENABLE_WAYLAND "Enable wayland canvas" OFF)
+ option(ENABLE_DBUS "Enable dbus support" OFF)
+ option(ENABLE_OPENCV "Enable OpenCV image processing." ON)
++option(ENABLE_VIPS "Enable libvips image processing." ON)
+ option(ENABLE_TURBOBASE64 "Enable Turbo-Base64 for base64 encoding." OFF)
+ option(ENABLE_OPENGL "Enable canvas rendering with OpenGL." OFF)
+ 
+@@ -42,6 +43,9 @@
+ include(GNUInstallDirs)
+ include(CheckCXXSymbolExists)
+ 
++set(UEBERZUGPP_CLI11_SOURCE_DIR "" CACHE PATH "Path to a local CLI11 source tree")
++set(UEBERZUGPP_RANGE_V3_SOURCE_DIR "" CACHE PATH "Path to a local range-v3 source tree")
++
+ find_package(PkgConfig REQUIRED)
+ find_package(Threads REQUIRED)
+ find_package(OpenSSL REQUIRED)
+@@ -57,7 +61,9 @@
+ 
+ find_package(CLI11 QUIET)
+ if(NOT CLI11_FOUND)
+-  if(FETCHCONTENT_FULLY_DISCONNECTED)
++  if(UEBERZUGPP_CLI11_SOURCE_DIR)
++    add_subdirectory("${UEBERZUGPP_CLI11_SOURCE_DIR}" "${PROJECT_BINARY_DIR}/cli11" EXCLUDE_FROM_ALL)
++  elseif(FETCHCONTENT_FULLY_DISCONNECTED)
+     add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/CLI11")
+   else()
+     FetchContent_Declare(
+@@ -97,12 +103,16 @@
+ 
+ find_package(range-v3 QUIET)
+ if(NOT range-v3_FOUND)
+-  FetchContent_Declare(
+-    range-v3
+-    URL https://github.com/ericniebler/range-v3/archive/refs/tags/0.12.0.tar.gz)
+-  FetchContent_Populate(range-v3)
+-  add_subdirectory(${range-v3_SOURCE_DIR} ${range-v3_BINARY_DIR}
+-                   EXCLUDE_FROM_ALL)
++  if(UEBERZUGPP_RANGE_V3_SOURCE_DIR)
++    add_subdirectory("${UEBERZUGPP_RANGE_V3_SOURCE_DIR}" "${PROJECT_BINARY_DIR}/range-v3" EXCLUDE_FROM_ALL)
++  else()
++    FetchContent_Declare(
++      range-v3
++      URL https://github.com/ericniebler/range-v3/archive/refs/tags/0.12.0.tar.gz)
++    FetchContent_Populate(range-v3)
++    add_subdirectory(${range-v3_SOURCE_DIR} ${range-v3_BINARY_DIR}
++                     EXCLUDE_FROM_ALL)
++  endif()
+ endif()
+ 
+ if(ENABLE_OPENGL)
+@@ -210,7 +220,10 @@
+ 
+ target_compile_definitions(ueberzug PRIVATE $<$<CONFIG:Debug>: DEBUG >)
+ 
+-pkg_check_modules(VIPS REQUIRED IMPORTED_TARGET vips-cpp)
++if(ENABLE_VIPS)
++  target_compile_definitions(ueberzug PRIVATE ENABLE_VIPS)
++  pkg_check_modules(VIPS REQUIRED IMPORTED_TARGET vips-cpp)
++endif()
+ pkg_check_modules(SIXEL REQUIRED IMPORTED_TARGET libsixel)
+ pkg_check_modules(CHAFA REQUIRED IMPORTED_TARGET chafa>=1.6)
+ 
+@@ -247,7 +260,11 @@
+   "src/canvas/iterm2/iterm2.cpp"
+   "src/canvas/iterm2/chunk.cpp"
+   "src/image.cpp"
+-  "src/image/libvips.cpp")
++)
++
++if(ENABLE_VIPS)
++  list(APPEND UEBERZUG_SOURCES "src/image/libvips.cpp")
++endif()
+ 
+ list(
+   APPEND
+@@ -260,10 +277,13 @@
+   range-v3
+   OpenSSL::Crypto
+   TBB::tbb
+-  PkgConfig::VIPS
+   PkgConfig::SIXEL
+   PkgConfig::CHAFA)
+ 
++if(ENABLE_VIPS)
++  list(APPEND UEBERZUG_LIBRARIES PkgConfig::VIPS)
++endif()
++
+ target_include_directories(ueberzug PRIVATE "${CMAKE_SOURCE_DIR}/include"
+                                             "${PROJECT_BINARY_DIR}")
+ target_sources(ueberzug PRIVATE ${UEBERZUG_SOURCES})
+--- a/src/image.cpp
++++ b/src/image.cpp
+@@ -20,14 +20,18 @@
+ #endif
+ #include "dimensions.hpp"
+ #include "flags.hpp"
+-#include "image/libvips.hpp"
++#ifdef ENABLE_VIPS
++#  include "image/libvips.hpp"
++#endif
+ #include "util.hpp"
+ 
+ #ifdef ENABLE_OPENCV
+ #  include <opencv2/imgcodecs.hpp>
+ #endif
+ #include <spdlog/spdlog.h>
+-#include <vips/vips.h>
++#ifdef ENABLE_VIPS
++#  include <vips/vips.h>
++#endif
+ 
+ namespace fs = std::filesystem;
+ using njson = nlohmann::json;
+@@ -55,7 +59,11 @@
+     }
+ 
+ #ifdef ENABLE_OPENCV
+-    if (cv::haveImageReader(image_path) && !flags->no_opencv) {
++    bool use_opencv = true;
++#  ifdef ENABLE_VIPS
++    use_opencv = !flags->no_opencv;
++#  endif
++    if (cv::haveImageReader(image_path) && use_opencv) {
+         try {
+             return std::make_unique<OpencvImage>(dimensions, image_path, in_cache);
+         } catch (const std::runtime_error &) {
+@@ -63,6 +71,7 @@
+         }
+     }
+ #endif
++#ifdef ENABLE_VIPS
+     const auto *vips_loader = vips_foreign_find_load(image_path.c_str());
+     if (vips_loader != nullptr) {
+         try {
+@@ -71,6 +80,7 @@
+             return nullptr;
+         }
+     }
++#endif
+     return nullptr;
+ }
+ 
+@@ -81,6 +91,7 @@
+         return orig_path;
+     }
+ 
++#ifdef ENABLE_VIPS
+     vips::VImage cache_img;
+     try {
+         cache_img = vips::VImage::new_from_file(cache_path.c_str());
+@@ -89,6 +100,16 @@
+     }
+     const uint32_t img_width = cache_img.width();
+     const uint32_t img_height = cache_img.height();
++#elif defined(ENABLE_OPENCV)
++    const auto cache_img = cv::imread(cache_path.string(), cv::IMREAD_UNCHANGED);
++    if (cache_img.empty()) {
++        return orig_path;
++    }
++    const uint32_t img_width = cache_img.cols;
++    const uint32_t img_height = cache_img.rows;
++#else
++    return orig_path;
++#endif
+     const uint32_t dim_width = dimensions.max_wpixels();
+     const uint32_t dim_height = dimensions.max_hpixels();
+     const int delta = 10;
+--- a/src/application.cpp
++++ b/src/application.cpp
+@@ -29,7 +29,9 @@
+ #include <fmt/format.h>
+ #include <nlohmann/json.hpp>
+ #include <spdlog/sinks/basic_file_sink.h>
+-#include <vips/vips8>
++#ifdef ENABLE_VIPS
++#  include <vips/vips8>
++#endif
+ 
+ using njson = nlohmann::json;
+ namespace fs = std::filesystem;
+@@ -58,10 +60,12 @@
+     if (flags->no_cache) {
+         logger->info("Image caching is disabled");
+     }
++#ifdef ENABLE_VIPS
+     if (VIPS_INIT(executable)) {
+         vips_error_exit(nullptr);
+     }
+     vips_cache_set_max(1);
++#endif
+ }
+ 
+ Application::~Application()
+@@ -71,7 +75,9 @@
+     }
+     logger->info("Exiting ueberzugpp");
+     canvas.reset();
++#ifdef ENABLE_VIPS
+     vips_shutdown();
++#endif
+     tmux::unregister_hooks();
+     fs::remove(util::get_socket_path());
+ }
+--- a/src/util/util.cpp
++++ b/src/util/util.cpp
+@@ -44,7 +44,9 @@
+ #endif
+ #include <range/v3/all.hpp>
+ 
+-#include <vips/vips8>
++#ifdef ENABLE_VIPS
++#  include <vips/vips8>
++#endif
+ 
+ namespace fs = std::filesystem;
+ using njson = nlohmann::json;
+@@ -234,12 +236,16 @@
+ 
+ auto util::read_exif_rotation(const fs::path &path) -> std::optional<std::uint16_t>
+ {
++#ifdef ENABLE_VIPS
+     try {
+         auto image = vips::VImage::new_from_file(path.c_str());
+         return image.get_int("orientation");
+     } catch (const vips::VError &) {
+         return {};
+     }
++#else
++    return {};
++#endif
+ }
+ 
+ auto util::round_up(int num_to_round, int multiple) -> int
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -90,7 +90,9 @@
+     layer_command->add_option("--pid-file", flags->pid_file, "Output file where to write the daemon PID.");
+     layer_command->add_flag("--no-stdin", flags->no_stdin, "Do not listen on stdin for commands.")->needs("--pid-file");
+     layer_command->add_flag("--no-cache", flags->no_cache, "Disable caching of resized images.");
++#ifdef ENABLE_VIPS
+     layer_command->add_flag("--no-opencv", flags->no_opencv, "Do not use OpenCV, use Libvips instead.");
++#endif
+     layer_command->add_option("-o,--output", flags->output, "Image output method")
+         ->check(CLI::IsMember({"x11", "wayland", "sixel", "kitty", "iterm2", "chafa"}));
+     layer_command->add_flag("--origin-center", flags->origin_center, "Location of the origin wrt the image");
